@@ -1,0 +1,405 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enni=20H=C3=A4m=C3=A4l=C3=A4inen?=
+ <enni.hamalainen@seafarix.com>
+Date: Thu, 20 Aug 2026 13:25:20 +0300
+Subject: [PATCH] Update plugin to use libsidplayfp 3.x
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Enni Hämäläinen <enni.hamalainen@seafarix.com>
+---
+ gst-plugin/gstsiddecfp.cc | 189 +++++++++++++++++++++++---------------
+ gst-plugin/gstsiddecfp.h  |   2 +-
+ gst-plugin/meson.build    |   2 +-
+ 3 files changed, 116 insertions(+), 77 deletions(-)
+
+diff --git a/gst-plugin/gstsiddecfp.cc b/gst-plugin/gstsiddecfp.cc
+index 7cff769b4f90a95250194beaa6d64ce40be3a527..8eeaea7e780ad1c05835451966c0303f46aac7a4 100644
+--- a/gst-plugin/gstsiddecfp.cc
++++ b/gst-plugin/gstsiddecfp.cc
+@@ -45,7 +45,6 @@
+ #include "config.h"
+ #endif
+ 
+-#include <sidplayfp/builders/resid.h>
+ #include <sidplayfp/builders/residfp.h>
+ #include <sidplayfp/SidTuneInfo.h>
+ 
+@@ -67,6 +66,10 @@
+ #define DEFAULT_FILTER_CURVE_8580 0.5
+ #define DEFAULT_FILTER_BIAS 0.5
+ #define DEFAULT_BLOCKSIZE 4096
++#define DEFAULT_CHANNELS 1
++
++/* libsidplayfp 3.x caps play() at 20000 cycles (~20ms of C64 time). */
++#define SIDDECFP_PLAY_CYCLES 20000
+ 
+ #define MAX_SID_TUNE_BUF_SIZE (8*DEFAULT_BLOCKSIZE) /* more than enough */
+ 
+@@ -122,7 +125,6 @@ gst_emulation_get_type (void)
+   static GType emulation_type = 0;
+   static const GEnumValue emulation[] = {
+     {SIDDECFP_EMULATION_RESIDFP, "RESIDFP", "residfp"},
+-    {SIDDECFP_EMULATION_RESID, "RESID", "resid"},
+     {0, NULL, NULL},
+   };
+ 
+@@ -295,11 +297,6 @@ gst_siddecfp_class_init (GstSidDecFpClass * klass)
+           "Filter curve 8580. ReSIDfp emulaton only",
+           0, 1.0, DEFAULT_FILTER_CURVE_8580,
+           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+-  g_object_class_install_property (G_OBJECT_CLASS (klass), PROP_FILTER_BIAS,
+-      g_param_spec_double ("filter-bias", "Filter bias",
+-          "Filter bias is given in millivolts. ReSID emulaton only",
+-          -600.0, 600, DEFAULT_FILTER_BIAS,
+-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+   g_object_class_install_property (G_OBJECT_CLASS (klass), PROP_BLOCKSIZE,
+       g_param_spec_uint ("blocksize", "Block size",
+           "Size in bytes to output per buffer", 1, G_MAXUINT,
+@@ -338,74 +335,48 @@ gst_siddecfp_class_init (GstSidDecFpClass * klass)
+   gst_type_mark_as_plugin_api (GST_TYPE_SAMPLING_METHOD, static_cast<GstPluginAPIFlags>(0));
+ }
+ 
+-static gboolean
+-is_sidbuilder_valid (sidbuilder *builder)
++static void
++apply_filters (GstSidDecFp * siddecfp)
+ {
+-    if (builder == NULL) return FALSE;
+-    if (!builder->getStatus ()) return FALSE;
+-    return TRUE;
++  unsigned int i, n;
++
++  n = siddecfp->player->installedSIDs ();
++  for (i = 0; i < n; i++)
++    siddecfp->player->filter (i, siddecfp->filter);
+ }
+ 
+ static gboolean
+ create_builder (GstSidDecFp * siddecfp)
+ {
+-  sidbuilder *builder = siddecfp->config.sidEmulation;
+-  siddecfp->config.sidEmulation = NULL;
+-  if (builder != NULL) {
+-    delete builder;
+-    builder = NULL;
+-  }
+-  if (siddecfp->emulation == SIDDECFP_EMULATION_RESIDFP) {
+-    ReSIDfpBuilder *rsfp = new ReSIDfpBuilder ("ReSIDfp");
+-    if (!is_sidbuilder_valid (rsfp)) {
+-      return FALSE;
+-    }
+-    rsfp->create ((siddecfp->player->info ()).maxsids ());
+-    if (!is_sidbuilder_valid (rsfp)) {
+-      return FALSE;
+-    }
+-    rsfp->filter (false);
+-    if (!is_sidbuilder_valid (rsfp)) {
+-      return FALSE;
+-    }
+-
+-    rsfp->filter6581Curve (siddecfp->filter_curve_6581);
+-    rsfp->filter8580Curve (siddecfp->filter_curve_8580);
++  sidbuilder *old_builder;
++  ReSIDfpBuilder *rsfp;
+ 
+-    builder = rsfp;
++  if (siddecfp->emulation != SIDDECFP_EMULATION_RESIDFP)
++    return FALSE;
+ 
+-    GST_DEBUG_OBJECT (siddecfp, "using ReSIDfp emulation");
+-  } else if (siddecfp->emulation == SIDDECFP_EMULATION_RESID) {
+-    ReSIDBuilder *rs = new ReSIDBuilder("ReSID");
+-    if (!is_sidbuilder_valid (rs)) {
+-      return FALSE;
+-    }
+-    rs->create ((siddecfp->player->info ()).maxsids ());
+-    if (!is_sidbuilder_valid (rs)) {
+-      return FALSE;
+-    }
+-    rs->filter (false);
+-    if (!is_sidbuilder_valid (rs)) {
+-      return FALSE;
+-    }
+-    rs->bias (siddecfp->filter_bias);
++  rsfp = new ReSIDfpBuilder ("ReSIDfp");
++  if (rsfp == NULL)
++    return FALSE;
+ 
+-    builder = rs;
++  rsfp->filter6581Curve (siddecfp->filter_curve_6581);
++  rsfp->filter8580Curve (siddecfp->filter_curve_8580);
+ 
+-    GST_DEBUG_OBJECT (siddecfp, "using ReSID emulation");
++  old_builder = siddecfp->builder;
++  siddecfp->builder = rsfp;
++  siddecfp->config.sidEmulation = rsfp;
+ 
+-  } else {
++  if (!siddecfp->player->config (siddecfp->config)) {
++    GST_ERROR_OBJECT (siddecfp, "sidplayfp config failed: %s",
++        siddecfp->player->error ());
++    siddecfp->builder = old_builder;
++    siddecfp->config.sidEmulation = old_builder;
++    delete rsfp;
+     return FALSE;
+   }
+ 
+-  if (builder == NULL) return FALSE;
+-
+-  if (siddecfp->kernal != NULL) siddecfp->player->setKernal (siddecfp->kernal->data);
+-  if (siddecfp->basic != NULL) siddecfp->player->setBasic (siddecfp->basic->data);
+-  if (siddecfp->chargen != NULL) siddecfp->player->setChargen (siddecfp->chargen->data);
++  delete old_builder;
+ 
+-  siddecfp->config.sidEmulation = builder;
+-  siddecfp->player->config (siddecfp->config);
++  GST_DEBUG_OBJECT (siddecfp, "using ReSIDfp emulation");
+   return TRUE;
+ }
+ 
+@@ -426,8 +397,17 @@ gst_siddecfp_init (GstSidDecFp * siddecfp)
+ 
+   siddecfp->player = new sidplayfp ();
+   siddecfp->tune = new SidTune (0);
++  siddecfp->builder = NULL;
+ 
+   siddecfp->emulation = DEFAULT_EMULATION;    /* emulation */
++  siddecfp->filter = DEFAULT_FILTER;
++  siddecfp->filter_curve_6581 = DEFAULT_FILTER_CURVE_6581;
++  siddecfp->filter_curve_8580 = DEFAULT_FILTER_CURVE_8580;
++  siddecfp->filter_bias = DEFAULT_FILTER_BIAS;
++  siddecfp->kernal = NULL;
++  siddecfp->basic = NULL;
++  siddecfp->chargen = NULL;
++  siddecfp->channels = DEFAULT_CHANNELS;
+ 
+   /* get default config parameters */
+   siddecfp->config = siddecfp->player->config ();
+@@ -462,9 +442,9 @@ gst_siddecfp_finalize (GObject * object)
+ 
+   g_free (siddecfp->tune_buffer);
+ 
+-  delete (siddecfp->config.sidEmulation);
+-  delete (siddecfp->tune);
+   delete (siddecfp->player);
++  delete (siddecfp->tune);
++  delete (siddecfp->builder);
+ 
+   G_OBJECT_CLASS (parent_class)->finalize (object);
+ }
+@@ -552,8 +532,7 @@ siddecfp_negotiate (GstSidDecFp * siddecfp)
+   gst_structure_get_int (structure, "rate", &rate);
+   siddecfp->config.frequency = rate;
+   gst_structure_get_int (structure, "channels", &channels);
+-  siddecfp->config.playback = (channels == 1) ?
+-      SidConfig::MONO : SidConfig::STEREO;
++  siddecfp->channels = channels;
+ 
+   stream_id =
+       gst_pad_create_stream_id (siddecfp->srcpad, GST_ELEMENT_CAST (siddecfp),
+@@ -582,14 +561,12 @@ siddecfp_negotiate (GstSidDecFp * siddecfp)
+       "format", G_TYPE_STRING, gst_audio_format_to_string (format),
+       "layout", G_TYPE_STRING, "interleaved",
+       "rate", G_TYPE_INT, siddecfp->config.frequency,
+-      "channels", G_TYPE_INT, siddecfp->config.playback, NULL);
++      "channels", G_TYPE_INT, siddecfp->channels, NULL);
+   gst_pad_set_caps (siddecfp->srcpad, caps);
+   gst_caps_unref (caps);
+ 
+   gst_caps_unref (allowed);
+ 
+-  siddecfp->player->config (siddecfp->config);
+-
+   return TRUE;
+ 
+   /* ERRORS */
+@@ -616,14 +593,31 @@ play_loop (GstPad * pad)
+   gint64 value, offset, time = 0;
+   GstFormat format;
+   guint play_bytes;
++  int buf_size;
++  int samples;
++  unsigned int mixed;
++
+   siddecfp = GST_SIDDECFP (gst_pad_get_parent (pad));
+ 
+-  out = gst_buffer_new_and_alloc (siddecfp->blocksize);
++  buf_size = siddecfp->player->getBufSize (SIDDECFP_PLAY_CYCLES);
++  if (buf_size <= 0)
++    goto mixer_error;
++
++  out = gst_buffer_new_and_alloc (buf_size * sizeof (gint16));
+ 
+   gst_buffer_map (out, &outmap, GST_MAP_WRITE);
+-  play_bytes = siddecfp->player->play ((gint16 *)outmap.data, siddecfp->blocksize/2) * 2;
++  samples = siddecfp->player->play (SIDDECFP_PLAY_CYCLES);
++  if (samples < 0) {
++    gst_buffer_unmap (out, &outmap);
++    gst_buffer_unref (out);
++    goto play_error;
++  }
++  mixed = siddecfp->player->mix ((gint16 *) outmap.data, samples);
+   gst_buffer_unmap (out, &outmap);
+ 
++  play_bytes = mixed * sizeof (gint16);
++  gst_buffer_set_size (out, play_bytes);
++
+   /* get offset in samples */
+   format = GST_FORMAT_DEFAULT;
+   if (gst_siddecfp_src_convert (siddecfp->srcpad,
+@@ -675,6 +669,22 @@ pause:
+     gst_pad_pause_task (pad);
+     goto done;
+   }
++mixer_error:
++  {
++    GST_ELEMENT_ERROR (siddecfp, LIBRARY, FAILED,
++        ("Mixer not initialized"), (NULL));
++    gst_pad_push_event (pad, gst_event_new_eos ());
++    gst_pad_pause_task (pad);
++    goto done;
++  }
++play_error:
++  {
++    GST_ELEMENT_ERROR (siddecfp, LIBRARY, FAILED,
++        ("SID playback failed"), ("%s", siddecfp->player->error ()));
++    gst_pad_push_event (pad, gst_event_new_eos ());
++    gst_pad_pause_task (pad);
++    goto done;
++  }
+ }
+ 
+ static gboolean
+@@ -683,20 +693,32 @@ start_play_tune (GstSidDecFp * siddecfp)
+   gboolean res;
+   GstSegment segment;
+ 
++  if (siddecfp->kernal != NULL)
++    siddecfp->player->setKernal (siddecfp->kernal->data);
++  if (siddecfp->basic != NULL)
++    siddecfp->player->setBasic (siddecfp->basic->data);
++  if (siddecfp->chargen != NULL)
++    siddecfp->player->setChargen (siddecfp->chargen->data);
++
+   siddecfp->tune->read (siddecfp->tune_buffer, siddecfp->tune_len);
++  if (!siddecfp->tune->getStatus ())
++    goto could_not_read;
+ 
+   if (!siddecfp->tune->selectSong (siddecfp->tune_number))
+     goto could_not_select_song;
+ 
+-  if (!siddecfp->player->load(siddecfp->tune))
+-    goto could_not_load;
+-
+   if (!siddecfp_negotiate (siddecfp))
+     goto could_not_negotiate;
+ 
+   if (!create_builder (siddecfp))
+     goto could_not_create_builder;
+ 
++  if (!siddecfp->player->load (siddecfp->tune))
++    goto could_not_load;
++
++  apply_filters (siddecfp);
++  siddecfp->player->initMixer (siddecfp->channels == 2);
++
+   gst_segment_init (&segment, GST_FORMAT_TIME);
+   gst_pad_push_event (siddecfp->srcpad, gst_event_new_segment (&segment));
+   siddecfp->total_bytes = 0;
+@@ -711,16 +733,22 @@ start_play_tune (GstSidDecFp * siddecfp)
+   return res;
+ 
+   /* ERRORS */
++could_not_read:
++  {
++    GST_ELEMENT_ERROR (siddecfp, LIBRARY, INIT,
++        ("Could not read tune"), ("%s", siddecfp->tune->statusString ()));
++    return FALSE;
++  }
+ could_not_select_song:
+   {
+     GST_ELEMENT_ERROR (siddecfp, LIBRARY, INIT,
+-        ("Could not select song"), ("Could not select song"));
++        ("Could not select song"), (NULL));
+     return FALSE;
+   }
+ could_not_load:
+   {
+     GST_ELEMENT_ERROR (siddecfp, LIBRARY, INIT,
+-        ("Could not load tune"), ("Could not load tune"));
++        ("Could not load tune"), ("%s", siddecfp->player->error ()));
+     return FALSE;
+   }
+ could_not_negotiate:
+@@ -807,7 +835,7 @@ gst_siddecfp_src_convert (GstPad * pad, GstFormat src_format, gint64 src_value,
+   }
+ 
+   bytes_per_sample =
+-      (16 >> 3) * siddecfp->config.playback;
++      (16 >> 3) * siddecfp->channels;
+ 
+   switch (src_format) {
+     case GST_FORMAT_BYTES:
+@@ -941,6 +969,7 @@ gst_siddecfp_set_property (GObject * object, guint prop_id, const GValue * value
+       break;
+     case PROP_FILTER:
+       siddecfp->filter = g_value_get_boolean (value);
++      apply_filters (siddecfp);
+       break;
+     case PROP_C64_MODEL:
+       siddecfp->config.defaultC64Model = (SidConfig::c64_model_t)g_value_get_enum (value);
+@@ -965,9 +994,19 @@ gst_siddecfp_set_property (GObject * object, guint prop_id, const GValue * value
+       break;
+     case PROP_FILTER_CURVE_6581:
+       siddecfp->filter_curve_6581 = g_value_get_double (value);
++      if (siddecfp->emulation == SIDDECFP_EMULATION_RESIDFP &&
++          siddecfp->builder != NULL) {
++        static_cast<ReSIDfpBuilder *>(siddecfp->builder)->filter6581Curve (
++            siddecfp->filter_curve_6581);
++      }
+       break;
+     case PROP_FILTER_CURVE_8580:
+       siddecfp->filter_curve_8580 = g_value_get_double (value);
++      if (siddecfp->emulation == SIDDECFP_EMULATION_RESIDFP &&
++          siddecfp->builder != NULL) {
++        static_cast<ReSIDfpBuilder *>(siddecfp->builder)->filter8580Curve (
++            siddecfp->filter_curve_8580);
++      }
+       break;
+     case PROP_FILTER_BIAS:
+       siddecfp->filter_bias = g_value_get_double (value);
+diff --git a/gst-plugin/gstsiddecfp.h b/gst-plugin/gstsiddecfp.h
+index 8301bc6c6c28f68cf123ac9e03353c1764752fb7..3b1871979b31d9422d3b8608505a0d687b5f792a 100644
+--- a/gst-plugin/gstsiddecfp.h
++++ b/gst-plugin/gstsiddecfp.h
+@@ -33,7 +33,6 @@ G_BEGIN_DECLS
+ 
+ typedef enum {
+     SIDDECFP_EMULATION_RESIDFP,
+-    SIDDECFP_EMULATION_RESID,
+ } SidDecFpEmulation;
+ 
+ 
+@@ -78,6 +77,7 @@ struct _GstSidDecFp {
+   GByteArray    *kernal;
+   GByteArray    *basic;
+   GByteArray    *chargen;
++  gint          channels;
+ 
+   guint         blocksize;
+ };
+diff --git a/gst-plugin/meson.build b/gst-plugin/meson.build
+index e65391bc1e30642edb1c474a2ec87f426e03cfe5..8c2602182d51aaac769cd50abda616cf448c21e7 100644
+--- a/gst-plugin/meson.build
++++ b/gst-plugin/meson.build
+@@ -32,7 +32,7 @@ if not sidplayfp_dep.found()
+   subdir_done()
+ endif
+ 
+-# sidplayfp plugin works with libsidplayfp 2.x.x
++# sidplayfp plugin works with libsidplayfp 3.x.x
+ sidfp_code = '''#include <sidplayfp/sidplayfp.h>
+                 void somefunc (void) {
+                   sidplayfp fp = sidplayfp();

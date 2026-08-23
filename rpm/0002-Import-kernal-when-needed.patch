@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enni=20H=C3=A4m=C3=A4l=C3=A4inen?=
+ <enni.hamalainen@seafarix.com>
+Date: Sun, 23 Aug 2026 16:45:14 +0300
+Subject: [PATCH] Import kernal when needed
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Enni Hämäläinen <enni.hamalainen@seafarix.com>
+---
+ gst-plugin/gstsiddecfp.cc | 114 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 108 insertions(+), 6 deletions(-)
+
+diff --git a/gst-plugin/gstsiddecfp.cc b/gst-plugin/gstsiddecfp.cc
+index 8eeaea7e780ad1c05835451966c0303f46aac7a4..4ec821179b2b3a98f797694163171bdc276a2338 100644
+--- a/gst-plugin/gstsiddecfp.cc
++++ b/gst-plugin/gstsiddecfp.cc
+@@ -29,8 +29,10 @@
+  * This plugin will first load the complete program into memory before starting
+  * the emulator and producing output.
+  *
+- * To play RSID files: kernal, basic and possibly chargen ROM byte arrays should
+- * be set. PSID files works without those.
++ * To play RSID files a Kernal ROM is required. If the "kernal" property is
++ * not set, the plugin loads kernal.bin (or kernal) from the current directory
++ * or from the sidplayfp data directories when available. BASIC and chargen
++ * ROMs can still be set as properties. PSID files work without ROMs.
+  *
+  * Seeking is not (and cannot be) implemented.
+  *
+@@ -72,6 +74,7 @@
+ #define SIDDECFP_PLAY_CYCLES 20000
+ 
+ #define MAX_SID_TUNE_BUF_SIZE (8*DEFAULT_BLOCKSIZE) /* more than enough */
++#define KERNAL_ROM_SIZE 8192
+ 
+ 
+ enum
+@@ -335,6 +338,103 @@ gst_siddecfp_class_init (GstSidDecFpClass * klass)
+   gst_type_mark_as_plugin_api (GST_TYPE_SAMPLING_METHOD, static_cast<GstPluginAPIFlags>(0));
+ }
+ 
++static gchar *
++find_sidplayfp_file (const gchar *filename)
++{
++  const gchar * const *dirs;
++  gchar *path;
++  guint i;
++
++  if (g_file_test (filename, G_FILE_TEST_IS_REGULAR))
++    return g_strdup (filename);
++
++  path = g_build_filename (g_get_user_data_dir (), "sidplayfp", filename, NULL);
++  if (g_file_test (path, G_FILE_TEST_IS_REGULAR))
++    return path;
++  g_free (path);
++
++  dirs = g_get_system_data_dirs ();
++  for (i = 0; dirs != NULL && dirs[i] != NULL; i++) {
++    path = g_build_filename (dirs[i], "sidplayfp", filename, NULL);
++    if (g_file_test (path, G_FILE_TEST_IS_REGULAR))
++      return path;
++    g_free (path);
++  }
++
++  return NULL;
++}
++
++static GByteArray *
++load_rom_file (const gchar *path, gsize expected_size)
++{
++  gchar *contents = NULL;
++  gsize length = 0;
++  GByteArray *rom;
++
++  if (path == NULL)
++    return NULL;
++  if (!g_file_get_contents (path, &contents, &length, NULL))
++    return NULL;
++  if (length != expected_size) {
++    g_free (contents);
++    return NULL;
++  }
++
++  rom = g_byte_array_new ();
++  g_byte_array_append (rom, (const guint8 *) contents, length);
++  g_free (contents);
++  return rom;
++}
++
++static gboolean
++tune_needs_kernal (SidTune *tune)
++{
++  const SidTuneInfo *info = tune->getInfo ();
++
++  if (info == NULL)
++    return FALSE;
++
++  switch (info->compatibility ()) {
++    case SidTuneInfo::COMPATIBILITY_R64:
++    case SidTuneInfo::COMPATIBILITY_BASIC:
++      return TRUE;
++    default:
++      return FALSE;
++  }
++}
++
++static void
++ensure_kernal_for_rsid (GstSidDecFp * siddecfp)
++{
++  gchar *path;
++  GByteArray *rom;
++
++  if (siddecfp->kernal != NULL)
++    return;
++  if (!tune_needs_kernal (siddecfp->tune))
++    return;
++
++  path = find_sidplayfp_file ("kernal.bin");
++  if (path == NULL)
++    path = find_sidplayfp_file ("kernal");
++  if (path == NULL) {
++    GST_WARNING_OBJECT (siddecfp,
++        "RSID tune needs a Kernal ROM, but kernal.bin was not found");
++    return;
++  }
++
++  rom = load_rom_file (path, KERNAL_ROM_SIZE);
++  if (rom == NULL) {
++    GST_WARNING_OBJECT (siddecfp, "failed to load Kernal ROM from %s", path);
++    g_free (path);
++    return;
++  }
++
++  GST_DEBUG_OBJECT (siddecfp, "loaded Kernal ROM from %s", path);
++  g_free (path);
++  siddecfp->kernal = rom;
++}
++
+ static void
+ apply_filters (GstSidDecFp * siddecfp)
+ {
+@@ -693,6 +793,12 @@ start_play_tune (GstSidDecFp * siddecfp)
+   gboolean res;
+   GstSegment segment;
+ 
++  siddecfp->tune->read (siddecfp->tune_buffer, siddecfp->tune_len);
++  if (!siddecfp->tune->getStatus ())
++    goto could_not_read;
++
++  ensure_kernal_for_rsid (siddecfp);
++
+   if (siddecfp->kernal != NULL)
+     siddecfp->player->setKernal (siddecfp->kernal->data);
+   if (siddecfp->basic != NULL)
+@@ -700,10 +806,6 @@ start_play_tune (GstSidDecFp * siddecfp)
+   if (siddecfp->chargen != NULL)
+     siddecfp->player->setChargen (siddecfp->chargen->data);
+ 
+-  siddecfp->tune->read (siddecfp->tune_buffer, siddecfp->tune_len);
+-  if (!siddecfp->tune->getStatus ())
+-    goto could_not_read;
+-
+   if (!siddecfp->tune->selectSong (siddecfp->tune_number))
+     goto could_not_select_song;
+ 

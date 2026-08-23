@@ -1,0 +1,3 @@
+[submodule "gst-siddecfp"]
+	path = gst-siddecfp
+	url = https://github.com/sailfishos-mirror/gst-siddecfp.git
